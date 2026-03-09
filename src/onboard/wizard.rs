@@ -4659,19 +4659,27 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt("  Client Secret (AppSecret)")
                     .interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in separate thread — reqwest::blocking Response
+                // must be used and dropped there to avoid "Cannot drop a runtime" panic)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let body = serde_json::json!({
-                    "clientId": client_id,
-                    "clientSecret": client_secret,
-                });
-                match client
-                    .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
-                    .json(&body)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
+                let client_id_clone = client_id.clone();
+                let client_secret_clone = client_secret.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let body = serde_json::json!({
+                        "clientId": client_id_clone,
+                        "clientSecret": client_secret_clone,
+                    });
+                    let resp = client
+                        .post("https://api.dingtalk.com/v1.0/gateway/connections/open")
+                        .json(&body)
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    Ok::<_, reqwest::Error>(ok)
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok(true)) => {
                         println!(
                             "\r  {} DingTalk credentials verified        ",
                             style("✅").green().bold()
@@ -4726,32 +4734,40 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let app_secret: String =
                     Input::new().with_prompt("  App Secret").interact_text()?;
 
-                // Test connection
+                // Test connection (run entirely in separate thread — reqwest::blocking Response
+                // must be used and dropped there to avoid "Cannot drop a runtime" panic)
                 print!("  {} Testing connection... ", style("⏳").dim());
-                let client = reqwest::blocking::Client::new();
-                let body = serde_json::json!({
-                    "appId": app_id,
-                    "clientSecret": app_secret,
-                });
-                match client
-                    .post("https://bots.qq.com/app/getAppAccessToken")
-                    .json(&body)
-                    .send()
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        let data: serde_json::Value = resp.json().unwrap_or_default();
-                        if data.get("access_token").is_some() {
-                            println!(
-                                "\r  {} QQ Bot credentials verified        ",
-                                style("✅").green().bold()
-                            );
-                        } else {
-                            println!(
-                                "\r  {} Auth error — check your credentials",
-                                style("❌").red().bold()
-                            );
-                            continue;
-                        }
+                let app_id_clone = app_id.clone();
+                let app_secret_clone = app_secret.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let body = serde_json::json!({
+                        "appId": app_id_clone,
+                        "clientSecret": app_secret_clone,
+                    });
+                    let resp = client
+                        .post("https://bots.qq.com/app/getAppAccessToken")
+                        .json(&body)
+                        .send()?;
+                    let status_ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let has_token = data.get("access_token").is_some();
+                    Ok::<_, reqwest::Error>((status_ok, has_token))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, true))) => {
+                        println!(
+                            "\r  {} QQ Bot credentials verified        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    Ok(Ok((true, false))) => {
+                        println!(
+                            "\r  {} Auth error — check your credentials",
+                            style("❌").red().bold()
+                        );
+                        continue;
                     }
                     _ => {
                         println!(
