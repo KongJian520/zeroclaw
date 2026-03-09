@@ -315,14 +315,16 @@ impl LarkChannel {
         allowed_users: Vec<String>,
         mention_only: bool,
     ) -> Self {
-        Self::new_with_platform(
+        let mut ch = Self::new_with_platform(
             app_id,
             app_secret,
             verification_token,
             port,
             allowed_users,
             LarkPlatform::Lark,
-        )
+        );
+        ch.mention_only = mention_only;
+        ch
     }
 
     fn new_with_platform(
@@ -340,11 +342,20 @@ impl LarkChannel {
             port,
             allowed_users,
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
-            mention_only,
-            use_feishu: true,
+            mention_only: false,
+            use_feishu: matches!(platform, LarkPlatform::Feishu),
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Derive `LarkPlatform` from `use_feishu` flag.
+    fn platform(&self) -> LarkPlatform {
+        if self.use_feishu {
+            LarkPlatform::Feishu
+        } else {
+            LarkPlatform::Lark
         }
     }
 
@@ -362,26 +373,41 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            config.mention_only,
+            platform,
+        );
+        ch.mention_only = config.mention_only;
+        ch.receive_mode = config.receive_mode.clone();
+        ch
+    }
+
+    /// Build from `FeishuConfig` — always uses Feishu (CN) endpoints.
+    pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id.clone(),
+            config.app_secret.clone(),
+            config.verification_token.clone().unwrap_or_default(),
+            config.port,
+            config.allowed_users.clone(),
+            LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client(self.platform.proxy_service_key())
+        crate::config::build_runtime_proxy_client(self.platform().proxy_service_key())
     }
 
     fn channel_name(&self) -> &'static str {
-        self.platform.channel_name()
+        self.platform().channel_name()
     }
 
     fn api_base(&self) -> &'static str {
-        self.platform.api_base()
+        self.platform().api_base()
     }
 
     fn ws_base(&self) -> &'static str {
-        self.platform.ws_base()
+        self.platform().ws_base()
     }
 
     fn tenant_access_token_url(&self) -> String {
@@ -515,7 +541,7 @@ impl LarkChannel {
         let resp = self
             .http_client()
             .post(format!("{}/callback/ws/endpoint", self.ws_base()))
-            .header("locale", self.platform.locale_header())
+            .header("locale", self.platform().locale_header())
             .json(&serde_json::json!({
                 "AppID": self.app_id,
                 "AppSecret": self.app_secret,
