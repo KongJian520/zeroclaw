@@ -1127,10 +1127,22 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
+        let trimmed = message.content.trim();
+        let (msg_type, content) = if trimmed.starts_with('{')
+            && (trimmed.contains("\"type\"")
+                || trimmed.contains("\"elements\"")
+                || trimmed.contains("\"header\""))
+        {
+            // Interactive card JSON — pass through as-is
+            ("interactive", trimmed.to_string())
+        } else {
+            // Plain text
+            ("text", serde_json::json!({ "text": message.content }).to_string())
+        };
+
         let body = serde_json::json!({
             "receive_id": message.recipient,
-            "msg_type": "text",
+            "msg_type": msg_type,
             "content": content,
         });
 
