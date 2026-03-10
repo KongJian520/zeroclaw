@@ -811,6 +811,23 @@ fn parse_responses_response_body(
     })
 }
 
+/// Read response body with lossy UTF-8 decoding.
+///
+/// Unlike `response.text().await?` which can fail with "error decoding response body"
+/// on malformed content, this reads raw bytes first and converts lossily, preserving
+/// diagnostic information even when the response is not valid UTF-8 or truncated.
+async fn read_response_body_lossy(response: reqwest::Response) -> anyhow::Result<String> {
+    let status = response.status();
+    match response.bytes().await {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) => {
+            anyhow::bail!(
+                "Failed to read response body (status={status}): {e}"
+            );
+        }
+    }
+}
+
 impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
@@ -857,7 +874,7 @@ impl OpenAiCompatibleProvider {
             anyhow::bail!("{} Responses API error: {error}", self.name);
         }
 
-        let body = response.text().await?;
+        let body = read_response_body_lossy(response).await?;
         let responses = parse_responses_response_body(&self.name, &body)?;
 
         extract_responses_text(responses)
@@ -1204,7 +1221,7 @@ impl Provider for OpenAiCompatibleProvider {
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
         }
 
-        let body = response.text().await?;
+        let body = read_response_body_lossy(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         chat_response
@@ -1313,7 +1330,7 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(super::api_error(&self.name, response).await);
         }
 
-        let body = response.text().await?;
+        let body = read_response_body_lossy(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
 
         chat_response
@@ -1413,7 +1430,7 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(super::api_error(&self.name, response).await);
         }
 
-        let body = response.text().await?;
+        let body = read_response_body_lossy(response).await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
         let usage = chat_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,

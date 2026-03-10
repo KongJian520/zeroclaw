@@ -183,6 +183,35 @@ struct MsgReceivePayload {
     message: LarkMessage,
 }
 
+/// Payload for `card.action.trigger` events (card button callbacks).
+#[derive(Debug, serde::Deserialize)]
+struct CardActionPayload {
+    operator: CardActionOperator,
+    action: CardAction,
+    context: CardActionContext,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CardActionOperator {
+    open_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CardAction {
+    /// The `value` object set on the button component.
+    value: serde_json::Value,
+    /// Component tag, e.g. "button".
+    #[allow(dead_code)]
+    tag: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CardActionContext {
+    open_chat_id: Option<String>,
+    #[allow(dead_code)]
+    open_message_id: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct LarkSender {
     sender_id: LarkSenderId,
@@ -235,6 +264,79 @@ fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
 
 fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
     extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
+}
+
+/// Card detection result for `send()`.
+enum CardDetection {
+    /// `[card]` prefix with optional leading text and card JSON.
+    Explicit { leading_text: Option<String>, card_json: String },
+    /// Entire content is a valid card JSON (auto-detected).
+    PureCard(String),
+    /// Not a card — send as plain text.
+    PlainText,
+}
+
+/// Detect whether message content should be sent as a Feishu/Lark interactive card.
+///
+/// Two detection modes (in priority order):
+///
+/// 1. **Explicit `[card]` marker** — AI prefixes with `[card]` to explicitly send a card.
+///    Everything after `[card]` up to the first `{` is optional leading text;
+///    the JSON from `{` to end is the card.
+///
+/// 2. **Pure card JSON** — the entire content is a valid card JSON object
+///    (schema 2.0 with `body`, or template 1.0 with `data`).
+///
+/// Mixed text + JSON without `[card]` is **not** extracted — it is sent as plain text.
+fn detect_card(text: &str) -> CardDetection {
+    // Mode 1: explicit [card] prefix
+    if let Some(rest) = text.strip_prefix("[card]") {
+        let rest = rest.trim();
+        if let Some(brace_pos) = rest.find('{') {
+            let candidate = &rest[brace_pos..];
+            if is_valid_card_json(candidate) {
+                let prefix = rest[..brace_pos].trim();
+                let leading = if prefix.is_empty() { None } else { Some(prefix.to_string()) };
+                return CardDetection::Explicit {
+                    leading_text: leading,
+                    card_json: candidate.to_string(),
+                };
+            }
+        }
+        // [card] prefix but no valid card JSON found — treat the rest as card content anyway
+        // in case it's pure JSON right after [card]
+        if is_valid_card_json(rest) {
+            return CardDetection::Explicit {
+                leading_text: None,
+                card_json: rest.to_string(),
+            };
+        }
+    }
+
+    // Mode 2: entire content is a valid card JSON
+    if is_valid_card_json(text) {
+        return CardDetection::PureCard(text.to_string());
+    }
+
+    CardDetection::PlainText
+}
+
+/// Check if text is a valid Feishu card JSON (2.0 or 1.0 template).
+fn is_valid_card_json(text: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Some(obj) = parsed.as_object() else {
+        return false;
+    };
+
+    let is_card_v2 = obj.get("schema").and_then(|v| v.as_str()) == Some("2.0")
+        && obj.contains_key("body");
+
+    let is_card_v1_template = obj.get("type").and_then(|v| v.as_str()) == Some("template")
+        && obj.contains_key("data");
+
+    is_card_v2 || is_card_v1_template
 }
 
 fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
@@ -724,6 +826,16 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
+
+                    // Handle card action callbacks
+                    if event.header.event_type == "card.action.trigger" {
+                        if let Some(msg) = self.parse_card_action(&event.event) {
+                            tracing::debug!("Lark WS: card action in {}", msg.reply_target);
+                            if tx.send(msg).await.is_err() { break; }
+                        }
+                        continue;
+                    }
+
                     if event.header.event_type != "im.message.receive_v1" { continue; }
 
                     let event_payload = event.event;
@@ -990,6 +1102,76 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// Send a message body with automatic token-refresh retry.
+    async fn send_with_retry(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let (status, response) = self.send_text_once(url, token, body).await?;
+
+        if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_text_once(url, &new_token, body).await?;
+
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                anyhow::bail!(
+                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                );
+            }
+            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            return Ok(());
+        }
+
+        ensure_lark_send_success(status, &response, "without token refresh")?;
+        Ok(())
+    }
+
+    /// Parse a `card.action.trigger` event into a ChannelMessage.
+    ///
+    /// The button's `value` JSON is serialized as the message content so the
+    /// Agent can interpret callback data (e.g. tool confirmations).
+    fn parse_card_action(&self, event: &serde_json::Value) -> Option<ChannelMessage> {
+        let action: CardActionPayload = serde_json::from_value(event.clone()).ok()?;
+
+        let open_id = &action.operator.open_id;
+        if !self.is_user_allowed(open_id) {
+            tracing::warn!("Lark: ignoring card action from unauthorized user: {open_id}");
+            return None;
+        }
+
+        let chat_id = action.context.open_chat_id.as_deref().unwrap_or(open_id);
+
+        // Build a human-readable message from the button value.
+        let content = if let Some(s) = action.action.value.as_str() {
+            s.to_string()
+        } else if action.action.value.is_object() || action.action.value.is_array() {
+            serde_json::to_string(&action.action.value).unwrap_or_default()
+        } else {
+            action.action.value.to_string()
+        };
+
+        if content.is_empty() {
+            return None;
+        }
+
+        Some(ChannelMessage {
+            id: Uuid::new_v4().to_string(),
+            sender: chat_id.to_string(),
+            reply_target: chat_id.to_string(),
+            content,
+            channel: self.channel_name().to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        })
+    }
+
     /// Parse an event callback payload and extract text messages
     pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
@@ -1000,6 +1182,16 @@ impl LarkChannel {
             .pointer("/header/event_type")
             .and_then(|e| e.as_str())
             .unwrap_or("");
+
+        // Handle card action callbacks
+        if event_type == "card.action.trigger" {
+            if let Some(event) = payload.get("event") {
+                if let Some(msg) = self.parse_card_action(event) {
+                    messages.push(msg);
+                }
+            }
+            return messages;
+        }
 
         if event_type != "im.message.receive_v1" {
             return messages;
@@ -1128,45 +1320,42 @@ impl Channel for LarkChannel {
         let url = self.send_message_url();
 
         let trimmed = message.content.trim();
-        let (msg_type, content) = if trimmed.starts_with('{')
-            && (trimmed.contains("\"type\"")
-                || trimmed.contains("\"elements\"")
-                || trimmed.contains("\"header\""))
-        {
-            // Interactive card JSON — pass through as-is
-            ("interactive", trimmed.to_string())
-        } else {
-            // Plain text
-            ("text", serde_json::json!({ "text": message.content }).to_string())
-        };
 
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": msg_type,
-            "content": content,
-        });
-
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
-
-        if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
-
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
+        match detect_card(trimmed) {
+            CardDetection::Explicit { leading_text, card_json } => {
+                // Send optional leading text first, then the card.
+                if let Some(text) = leading_text {
+                    let text_body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "text",
+                        "content": serde_json::json!({ "text": text }).to_string(),
+                    });
+                    self.send_with_retry(&url, &token, &text_body).await?;
+                }
+                let card_body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "msg_type": "interactive",
+                    "content": card_json,
+                });
+                self.send_with_retry(&url, &token, &card_body).await
             }
-
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            return Ok(());
+            CardDetection::PureCard(card_json) => {
+                let card_body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "msg_type": "interactive",
+                    "content": card_json,
+                });
+                self.send_with_retry(&url, &token, &card_body).await
+            }
+            CardDetection::PlainText => {
+                let body = serde_json::json!({
+                    "receive_id": message.recipient,
+                    "msg_type": "text",
+                    "content": serde_json::json!({ "text": message.content }).to_string(),
+                });
+                self.send_with_retry(&url, &token, &body).await
+            }
         }
-
-        ensure_lark_send_success(status, &response, "without token refresh")?;
-        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -2116,16 +2305,18 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
 
-        let ch = LarkChannel::from_lark_config(&cfg);
+        let ch = LarkChannel::from_config(&cfg);
 
-        assert_eq!(ch.api_base(), LARK_BASE_URL);
-        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
-        assert_eq!(ch.name(), "lark");
+        // use_feishu=true in LarkConfig means Feishu endpoints
+        assert_eq!(ch.api_base(), FEISHU_BASE_URL);
+        assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
+        assert_eq!(ch.name(), "feishu");
     }
 
     #[test]
